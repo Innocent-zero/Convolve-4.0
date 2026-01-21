@@ -19,10 +19,10 @@ logging.basicConfig(
 
 from config import CHECKPOINT_DIR
 from utils.preprocessing import DocumentPreprocessor
-from utils.teacher_extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+from utils.extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
 from inference.sgan_extractor import SGANExtractor
-from inference.ensemble_inference import InferenceEnsemble
-from inference.validator import FieldValidator
+from inference.ensemble_v2 import InferenceEnsemble
+from utils.validators import FieldValidator
 
 
 def train_mode():

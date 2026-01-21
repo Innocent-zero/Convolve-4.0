@@ -10,7 +10,6 @@ from typing import Dict, List, Tuple, Union
 from pathlib import Path
 from tqdm import tqdm
 import logging
-
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,7 +86,9 @@ class PseudoLabelDataset(Dataset):
                 merged_results = self.teacher_ensemble.merge_predictions(
                     vlm_results, ocr_results, cv_results
                 )
-                
+                if not merged_results.get('valid', False):
+                    logging.warning(f"Skipping unusable sample: {img_path}")
+                    return self._empty_sample()
                 # Check consensus and confidence
                 field_labels = {}
                 field_confidences = {}

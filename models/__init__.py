@@ -1,6 +1,6 @@
 """Utility modules for preprocessing and teacher extraction"""
-from .preprocessing import DocumentPreprocessor
-from .teacher_extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+from utils.preprocessing import DocumentPreprocessor
+from utils.extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
 
 __all__ = [
     'DocumentPreprocessor',

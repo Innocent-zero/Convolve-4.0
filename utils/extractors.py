@@ -41,20 +41,52 @@ class VLMExtractor:
         """Extract fields using VLM"""
         pil_images = [Image.fromarray(img) if img.dtype == np.uint8 else Image.fromarray((img * 255).astype(np.uint8)) for img in images]
         
-        prompt = """Extract the following from this invoice/quotation in JSON format:
-{
-  "dealer_name": {"value": "...", "confidence": 0.0-1.0},
-  "model_name": {"value": "...", "confidence": 0.0-1.0},
-  "horse_power": {"value": number, "confidence": 0.0-1.0},
-  "asset_cost": {"value": number, "confidence": 0.0-1.0},
-  "signature": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0},
-  "stamp": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0}
-}"""
-        
-        inputs = self.processor(text=prompt, images=pil_images, return_tensors="pt").to(self.device)
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract the following from this invoice/quotation in JSON format:\n"
+                            "{\n"
+                            '  "dealer_name": {"value": "...", "confidence": 0.0-1.0},\n'
+                            '  "model_name": {"value": "...", "confidence": 0.0-1.0},\n'
+                            '  "horse_power": {"value": number, "confidence": 0.0-1.0},\n'
+                            '  "asset_cost": {"value": number, "confidence": 0.0-1.0},\n'
+                            '  "signature": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0},\n'
+                            '  "stamp": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0}\n'
+                            "}"
+                        )
+                    }
+                ]
+            }
+        ]
+
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.processor(
+            text=[prompt],
+            images=pil_images,
+            return_tensors="pt",
+            padding=True
+        ).to(self.device)
+
+        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
         
         with torch.no_grad():
-            output_ids = self.model.generate(**inputs, max_new_tokens=512, do_sample=False)
+            output_ids = self.model.generate(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=512
+        )
         
         generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
         
@@ -110,7 +142,7 @@ class OCRExtractor:
     
     def __init__(self):
         print("    Loading Teacher OCR (PaddleOCR)...")
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
         """Extract fields using OCR + regex"""
@@ -118,15 +150,17 @@ class OCRExtractor:
         
         for image in images:
             result = self.ocr.ocr(image, cls=True)
-            
-            if result and result[0]:
-                for line in result[0]:
-                    all_text.append({
-                        'text': line[1][0],
-                        'confidence': line[1][1],
-                        'bbox': line[0]
-                    })
-        
+            if not result or result[0] is None:
+                continue
+            for line in result[0]:
+                if line is None or len(line) < 2:
+                    continue
+                all_text.append({
+                    'text': line[1][0],
+                    'confidence': float(line[1][1]),
+                    'bbox': line[0]
+                })
+
         return self._extract_fields(all_text)
     
     def _extract_fields(self, text_blocks: List[Dict]) -> Dict[str, Any]:
@@ -290,7 +324,7 @@ class TeacherEnsemble:
         self.vlm = vlm
         self.ocr = ocr
         self.cv = cv
-        self.weights = {'vlm': 0.5, 'ocr': 0.35, 'cv': 0.15}
+        self.weights = {'vlm': 0.35, 'ocr': 0.30, 'cv': 0.35}
     
     def generate_pseudo_labels(
         self,
@@ -298,10 +332,9 @@ class TeacherEnsemble:
         language: str
     ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
         """Generate pseudo-labels from all three teachers"""
-        vlm_results = self.vlm.extract(images, language)
-        ocr_results = self.ocr.extract(images, language)
-        cv_results = self.cv.extract(images, language)
-        
+        vlm_results = self.vlm.extract(images, language) or {}
+        ocr_results = self.ocr.extract(images, language) or {}
+        cv_results  = self.cv.extract(images, language)  or {}
         return vlm_results, ocr_results, cv_results
     
     def merge_predictions(
@@ -318,12 +351,21 @@ class TeacherEnsemble:
             candidates = []
             for result, source in [(vlm_results, 'vlm'), (ocr_results, 'ocr'), (cv_results, 'cv')]:
                 if field in result and result[field]['value'] is not None:
-                    weighted_conf = result[field]['confidence'] * self.weights[source]
+                    weighted_conf = (
+                        result[field]['confidence'],
+                        self.weights[source]
+                    )
                     candidates.append((result[field]['value'], weighted_conf))
             
             if candidates:
-                best_value, best_conf = max(candidates, key=lambda x: x[1])
-                merged[field] = {'value': best_value, 'confidence': best_conf}
+                best_value, best_pair = max(
+                    candidates,
+                    key=lambda x: x[1][0] * x[1][1]
+                )
+                merged[field] = {
+                    'value': best_value,
+                    'confidence': best_pair[0]
+                }
             else:
                 merged[field] = {'value': None, 'confidence': 0.0}
         
@@ -339,5 +381,16 @@ class TeacherEnsemble:
                         best_detection = result[field]
             
             merged[field] = best_detection if best_detection else {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
-        
+        # Determine validity instead of returning None
+        has_any_text = any(
+            merged[f]['value'] is not None
+            for f in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
+        )
+
+        has_any_visual = (
+            merged['signature']['present'] or
+            merged['stamp']['present']
+        )
+
+        merged['valid'] = has_any_text or has_any_visual  
         return merged

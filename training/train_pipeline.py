@@ -19,7 +19,7 @@ from config import (
 )
 from models.spatial_graph_attention import SpatialGraphAttention
 from training.dataset import PseudoLabelDataset
-from train_sagan import SGANTrainer
+from training.train_sagan import SGANTrainer
 
 
 def get_image_paths(directory: Union[str, Path]) -> List[Path]:
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     
     # Import here to avoid circular dependencies
     from utils.preprocessing import DocumentPreprocessor
-    from utils.teacher_extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+    from utils.extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
     
     # Get image paths
     data_dir = Path("data")

@@ -39,19 +39,24 @@ class ConfidenceWeightedLoss(nn.Module):
         # Text fields (simplified: token classification)
         for field in ['dealer_name', 'model_name']:
             if field in labels and field in predictions:
-                if 'token_logits' in predictions[field]:
-                    batch_size = predictions[field]['token_logits'].size(0)
-                    target = torch.zeros_like(predictions[field]['token_logits'])
-                    
-                    confidence = label_confidences.get(field, 0.5)
-                    loss = self.bce_loss(predictions[field]['token_logits'], target)
-                    weighted_loss = (loss * confidence).mean()
-                    
-                    total_loss += weighted_loss
-                    num_fields += 1
+                presence_target = torch.ones_like(predictions[field]['logit'])
+                confidence = label_confidences.get(field, 0.5)
+
+                loss = self.bce_loss(
+                    predictions[field]['logit'],
+                    presence_target
+                )
+
+                total_loss += (loss * confidence).mean()
+                num_fields += 1
+
         
         # Numeric fields
         for field in ['horse_power', 'asset_cost']:
+            if field not in labels or field not in predictions:
+                continue
+            if labels[field] is None:
+                continue
             if field in labels and field in predictions:
                 target_value = labels[field]
                 predicted_value = predictions[field]['value']
@@ -123,8 +128,8 @@ class SGANTrainer:
             
             outputs = self.model(token_ids, bboxes, disagreement, attention_mask)
             
-            labels = batch['labels'][0]
-            confidences = batch['label_confidences'][0]
+            labels = batch['labels']
+            confidences = batch['label_confidences']
             
             loss = self.criterion(outputs, labels, confidences)
             
