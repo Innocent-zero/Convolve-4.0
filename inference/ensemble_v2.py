@@ -1,51 +1,44 @@
-import torch
+"""
+Inference Ensemble
+Combines SGAN (student) with teacher extractors as fallback
+"""
+
 import numpy as np
-from typing import List, Dict, Any, Optional
-from pathlib import Path
+from typing import List, Dict, Any
 
-from models.spatial_graph_attention import SpatialGraphAttention
-from sgan_extractor import SGANExtractor
-from utils.extractors import VLMExtractor,OCRExtractor,CVExtractor
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-class EnsembleExtractorV2:
+from config import SGAN_CONFIDENCE_THRESHOLD
+
+
+class InferenceEnsemble:
     """
-    Updated ensemble that uses SGAN as primary extractor.
+    Inference-time ensemble using SGAN as primary extractor.
     
-    Inference Strategy:
-    1. Run SGAN (our trained model)
-    2. If SGAN confidence is high (>0.85), use its predictions
-    3. Otherwise, fall back to VLM/OCR/CV ensemble
+    Strategy:
+    1. Run SGAN (trained student model)
+    2. If SGAN confidence is high, use its predictions
+    3. Otherwise, fall back to teacher ensemble (VLM/OCR/CV)
     4. For visual elements (signature/stamp), always use CV
-    
-    This positions SGAN as the primary learned component while maintaining
-    the robustness of the multi-modal ensemble.
     """
     
     def __init__(
         self,
-        sgan: SGANExtractor,
-        vlm: 'VLMExtractor',
-        ocr: 'OCRExtractor',
-        cv: 'CVExtractor',
-        sgan_confidence_threshold: float = 0.85
+        sgan_extractor,  # SGANExtractor
+        vlm_extractor,   # VLMExtractor (teacher)
+        ocr_extractor,   # OCRExtractor (teacher)
+        cv_extractor,    # CVExtractor (teacher)
+        sgan_confidence_threshold: float = SGAN_CONFIDENCE_THRESHOLD
     ):
-        """
-        Initialize ensemble with SGAN as primary.
-        
-        Args:
-            sgan: Our trained SGAN model (PRIMARY)
-            vlm: Vision-Language Model (TEACHER/FALLBACK)
-            ocr: OCR engine (TEACHER/FALLBACK)
-            cv: Computer Vision (for signatures/stamps)
-            sgan_confidence_threshold: Min confidence to trust SGAN
-        """
-        self.sgan = sgan
-        self.vlm = vlm
-        self.ocr = ocr
-        self.cv = cv
+        self.sgan = sgan_extractor
+        self.vlm = vlm_extractor
+        self.ocr = ocr_extractor
+        self.cv = cv_extractor
         self.sgan_threshold = sgan_confidence_threshold
         
-        # Weights for fallback ensemble
+        # Fallback ensemble weights
         self.fallback_weights = {
             'vlm': 0.50,
             'ocr': 0.35,
@@ -62,9 +55,9 @@ class EnsembleExtractorV2:
         Extract fields using specified strategy.
         
         Strategies:
-        - 'sgan_only': Use only SGAN
-        - 'ensemble_only': Use only VLM/OCR/CV
-        - 'adaptive': Use SGAN if confident, else ensemble (RECOMMENDED)
+        - 'sgan_only': Use only SGAN (student)
+        - 'teachers_only': Use only teacher ensemble
+        - 'adaptive': Use SGAN if confident, else teachers (RECOMMENDED)
         
         Args:
             images: Document images
@@ -74,40 +67,33 @@ class EnsembleExtractorV2:
         Returns:
             Extracted fields with metadata
         """
-        extraction_metadata = {
+        metadata = {
             'primary_extractor': None,
             'fallback_used': False,
             'sgan_confidence': None
         }
         
         if strategy == 'sgan_only':
-            # Use only our trained model
+            # Student only
             sgan_results = self.sgan.extract(images, language)
-            extraction_metadata['primary_extractor'] = 'sgan'
+            metadata['primary_extractor'] = 'sgan'
             
             # Get visual elements from CV
             cv_results = self.cv.extract(images, language)
             sgan_results['signature'] = cv_results['signature']
             sgan_results['stamp'] = cv_results['stamp']
             
-            return {
-                **sgan_results,
-                '_metadata': extraction_metadata
-            }
+            return {**sgan_results, '_metadata': metadata}
         
-        elif strategy == 'ensemble_only':
-            # Use traditional ensemble (VLM/OCR/CV)
+        elif strategy == 'teachers_only':
+            # Teachers only (for comparison)
             vlm_results = self.vlm.extract(images, language)
             ocr_results = self.ocr.extract(images, language)
             cv_results = self.cv.extract(images, language)
             
-            merged = self._merge_ensemble_results(
-                [vlm_results, ocr_results, cv_results],
-                ['vlm', 'ocr', 'cv']
-            )
-            
-            extraction_metadata['primary_extractor'] = 'ensemble'
-            merged['_metadata'] = extraction_metadata
+            merged = self._merge_teacher_results(vlm_results, ocr_results, cv_results)
+            metadata['primary_extractor'] = 'teachers'
+            merged['_metadata'] = metadata
             
             return merged
         
@@ -124,15 +110,15 @@ class EnsembleExtractorV2:
             ]
             
             avg_confidence = np.mean(confidences) if confidences else 0.0
-            extraction_metadata['sgan_confidence'] = avg_confidence
+            metadata['sgan_confidence'] = float(avg_confidence)
             
-            # Decision: Trust SGAN or fall back to ensemble?
+            # Decision: trust SGAN or fall back?
             if avg_confidence >= self.sgan_threshold:
-                # SGAN is confident - use its predictions
-                extraction_metadata['primary_extractor'] = 'sgan'
-                extraction_metadata['fallback_used'] = False
+                # SGAN is confident
+                metadata['primary_extractor'] = 'sgan'
+                metadata['fallback_used'] = False
                 
-                # Get visual elements from CV
+                # Get visual elements
                 cv_results = self.cv.extract(images, language)
                 sgan_results['signature'] = cv_results['signature']
                 sgan_results['stamp'] = cv_results['stamp']
@@ -140,53 +126,46 @@ class EnsembleExtractorV2:
                 final_results = sgan_results
             
             else:
-                # SGAN not confident - fall back to ensemble
-                extraction_metadata['primary_extractor'] = 'ensemble'
-                extraction_metadata['fallback_used'] = True
+                # Fall back to teachers
+                metadata['primary_extractor'] = 'teachers'
+                metadata['fallback_used'] = True
                 
                 vlm_results = self.vlm.extract(images, language)
                 ocr_results = self.ocr.extract(images, language)
                 cv_results = self.cv.extract(images, language)
                 
-                # Merge ensemble results
-                final_results = self._merge_ensemble_results(
-                    [vlm_results, ocr_results, cv_results],
-                    ['vlm', 'ocr', 'cv']
-                )
+                final_results = self._merge_teacher_results(vlm_results, ocr_results, cv_results)
                 
-                # Optionally blend with SGAN predictions (weighted combination)
+                # Optionally blend with SGAN (weighted)
                 for field in text_fields:
                     if field in sgan_results and sgan_results[field]['value'] is not None:
-                        # Weighted average: 30% SGAN, 70% ensemble
                         if field in final_results and final_results[field]['value'] is not None:
+                            # Boost confidence if SGAN agrees
                             ensemble_conf = final_results[field]['confidence']
                             sgan_conf = sgan_results[field]['confidence']
                             
-                            total_weight = ensemble_conf * 0.7 + sgan_conf * 0.3
-                            
-                            # Use ensemble value but boost confidence if SGAN agrees
                             final_results[field]['confidence'] = min(
-                                (ensemble_conf * 0.7 + sgan_conf * 0.3) / total_weight,
+                                (ensemble_conf * 0.7 + sgan_conf * 0.3),
                                 1.0
                             )
             
-            final_results['_metadata'] = extraction_metadata
+            final_results['_metadata'] = metadata
             return final_results
     
-    def _merge_ensemble_results(
+    def _merge_teacher_results(
         self,
-        results: List[Dict[str, Any]],
-        sources: List[str]
+        vlm_results: Dict[str, Any],
+        ocr_results: Dict[str, Any],
+        cv_results: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Merge results from VLM/OCR/CV ensemble (same as before)"""
+        """Merge teacher ensemble results"""
         merged = {}
         text_fields = ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
-        visual_fields = ['signature', 'stamp']
         
-        # Merge text fields
+        # Text fields: weighted voting
         for field in text_fields:
             candidates = []
-            for result, source in zip(results, sources):
+            for result, source in [(vlm_results, 'vlm'), (ocr_results, 'ocr'), (cv_results, 'cv')]:
                 if field in result and result[field]['value'] is not None:
                     weighted_conf = result[field]['confidence'] * self.fallback_weights[source]
                     candidates.append((result[field]['value'], weighted_conf))
@@ -197,12 +176,12 @@ class EnsembleExtractorV2:
             else:
                 merged[field] = {'value': None, 'confidence': 0.0}
         
-        # Merge visual fields
-        for field in visual_fields:
+        # Visual fields: best detection
+        for field in ['signature', 'stamp']:
             best_detection = None
             best_score = 0
             
-            for result, source in zip(results, sources):
+            for result, source in [(vlm_results, 'vlm'), (ocr_results, 'ocr'), (cv_results, 'cv')]:
                 if field in result and result[field]['present']:
                     score = result[field]['confidence'] * self.fallback_weights[source]
                     if score > best_score:
@@ -212,17 +191,13 @@ class EnsembleExtractorV2:
             if best_detection:
                 merged[field] = best_detection
             else:
-                merged[field] = {
-                    'present': False,
-                    'bbox': [0, 0, 0, 0],
-                    'confidence': 0.0
-                }
+                merged[field] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
         
         return merged
     
-    # Backwards compatibility methods
+    # Convenience methods (backwards compatibility)
     def extract_fast(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Fast path: SGAN only (our trained model)"""
+        """Fast path: SGAN only"""
         return self.extract_with_strategy(images, language, strategy='sgan_only')
     
     def extract_standard(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
@@ -230,5 +205,5 @@ class EnsembleExtractorV2:
         return self.extract_with_strategy(images, language, strategy='adaptive')
     
     def extract_robust(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Robust path: Full ensemble as fallback"""
+        """Robust path: Same as adaptive"""
         return self.extract_with_strategy(images, language, strategy='adaptive')

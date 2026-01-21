@@ -1,0 +1,35 @@
+from pathlib import Path
+
+# Paths
+PROJECT_ROOT = Path(__file__).parent
+DATA_DIR = PROJECT_ROOT / "data"
+CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+CHECKPOINT_DIR.mkdir(exist_ok=True)
+
+# Model settings
+VOCAB_SIZE = 10000
+D_MODEL = 256
+NUM_HEADS = 8
+NUM_LAYERS = 6
+MAX_TOKENS = 512
+
+# Training settings
+BATCH_SIZE = 1
+NUM_EPOCHS_INITIAL = 30
+NUM_EPOCHS_ITERATION = 20
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 0.01
+
+# Pseudo-label generation settings
+INITIAL_CONFIDENCE_THRESHOLD = 0.6
+CONSENSUS_REQUIREMENT = 2  # Out of 3 extractors
+
+# Inference settings
+SGAN_CONFIDENCE_THRESHOLD = 0.85
+
+# Validation settings
+FUZZY_MATCH_THRESHOLD = 90
+MIN_HORSE_POWER = 10
+MAX_HORSE_POWER = 200
+MIN_ASSET_COST = 100000
+MAX_ASSET_COST = 5000000

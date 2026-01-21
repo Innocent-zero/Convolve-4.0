@@ -1,286 +1,212 @@
 """
-Intelligent Document AI System - Main Executable
-Hybrid Multi-Modal Architecture for Invoice Field Extraction
+Main Entry Point for Document Extraction System
 
-Author: Hackathon Submission
-Date: January 2026
+This demonstrates the complete workflow:
+1. Training mode: Train SGAN from pseudo-labels
+2. Inference mode: Use trained SGAN with fallback ensemble
+3. Validation mode: Validate and normalize results
 """
 
-import os
-import sys
-import json
-import time
-import argparse
+import logging
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-import warnings
-warnings.filterwarnings('ignore')
+import sys
 
-# Import utility modules
-from utils.preprocessing import DocumentPreprocessor
-from utils.extractors import (
-    VLMExtractor,
-    OCRExtractor,
-    CVExtractor,
-    EnsembleExtractor
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
-from utils.validators import FieldValidator
-from utils.cost_tracker import CostTracker
 
-class InvoiceExtractionPipeline:
-    """Main orchestrator for invoice field extraction"""
-    
-    def __init__(self, config_path: str = "config/model_config.yaml"):
-        """Initialize the extraction pipeline"""
-        print("🚀 Initializing Invoice Extraction System...")
-        
-        # Initialize components
-        self.preprocessor = DocumentPreprocessor()
-        self.cost_tracker = CostTracker()
-        
-        # Initialize extractors
-        print("📦 Loading extraction models...")
-        self.vlm_extractor = VLMExtractor()
-        self.ocr_extractor = OCRExtractor()
-        self.cv_extractor = CVExtractor()
-        self.ensemble = EnsembleExtractor(
-            vlm=self.vlm_extractor,
-            ocr=self.ocr_extractor,
-            cv=self.cv_extractor
-        )
-        
-        # Initialize validator
-        self.validator = FieldValidator()
-        
-        print("✅ System initialized successfully!\n")
-    
-    def process_document(self, pdf_path: str) -> Dict[str, Any]:
-        """
-        Process a single PDF document and extract fields
-        
-        Args:
-            pdf_path: Path to PDF file
-            
-        Returns:
-            Dictionary containing extracted fields and metadata
-        """
-        start_time = time.time()
-        doc_id = Path(pdf_path).stem
-        
-        print(f"📄 Processing document: {doc_id}")
-        
-        try:
-            # Stage 1: Preprocessing
-            print("  ⚙️  Stage 1: Preprocessing...")
-            processed_data = self.preprocessor.process(pdf_path)
-            images = processed_data['images']
-            quality_score = processed_data['quality_score']
-            language = processed_data['language']
-            
-            print(f"      Quality: {quality_score:.2f}, Language: {language}")
-            
-            # Stage 2: Adaptive Routing & Extraction
-            print("  🔍 Stage 2: Multi-path extraction...")
-            
-            # Determine extraction strategy based on quality
-            if quality_score > 0.8:
-                # High quality: Use faster path
-                extraction_path = "fast"
-                raw_results = self.ensemble.extract_fast(
-                    images=images,
-                    language=language
-                )
-            elif quality_score > 0.5:
-                # Medium quality: Use standard ensemble
-                extraction_path = "standard"
-                raw_results = self.ensemble.extract_standard(
-                    images=images,
-                    language=language
-                )
-            else:
-                # Low quality: Use all extractors
-                extraction_path = "robust"
-                raw_results = self.ensemble.extract_robust(
-                    images=images,
-                    language=language
-                )
-            
-            print(f"      Path: {extraction_path}")
-            
-            # Stage 3: Validation & Fuzzy Matching
-            print("  ✓  Stage 3: Validation...")
-            validated_results = self.validator.validate(
-                raw_results=raw_results,
-                language=language
-            )
-            
-            # Stage 4: Final assembly
-            processing_time = time.time() - start_time
-            cost = self.cost_tracker.calculate_cost(
-                extraction_path=extraction_path,
-                num_pages=len(images)
-            )
-            
-            result = {
-                "doc_id": doc_id,
-                "fields": {
-                    "dealer_name": validated_results['dealer_name']['value'],
-                    "model_name": validated_results['model_name']['value'],
-                    "horse_power": validated_results['horse_power']['value'],
-                    "asset_cost": validated_results['asset_cost']['value'],
-                    "signature": validated_results['signature'],
-                    "stamp": validated_results['stamp']
-                },
-                "confidence": validated_results['overall_confidence'],
-                "processing_time_sec": round(processing_time, 2),
-                "cost_estimate_usd": round(cost, 6),
-                "metadata": {
-                    "extraction_path": extraction_path,
-                    "quality_score": quality_score,
-                    "language": language,
-                    "num_pages": len(images)
-                }
-            }
-            
-            print(f"  ✅ Complete! Confidence: {result['confidence']:.2%}\n")
-            
-            return result
-            
-        except Exception as e:
-            print(f"  ❌ Error processing {doc_id}: {str(e)}\n")
-            return {
-                "doc_id": doc_id,
-                "error": str(e),
-                "processing_time_sec": time.time() - start_time
-            }
-    
-    def process_batch(self, input_dir: str, output_dir: str):
-        """
-        Process a batch of PDF documents
-        
-        Args:
-            input_dir: Directory containing PDF files
-            output_dir: Directory to save results
-        """
-        input_path = Path(input_dir)
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-        
-        # Find all PDF files
-        pdf_files = list(input_path.glob("*.pdf"))
-        
-        if not pdf_files:
-            print(f"⚠️  No PDF files found in {input_dir}")
-            return
-        
-        print(f"📊 Found {len(pdf_files)} documents to process\n")
-        print("=" * 60)
-        
-        results = []
-        successful = 0
-        failed = 0
-        
-        for i, pdf_file in enumerate(pdf_files, 1):
-            print(f"\n[{i}/{len(pdf_files)}] Processing: {pdf_file.name}")
-            
-            result = self.process_document(str(pdf_file))
-            results.append(result)
-            
-            if "error" not in result:
-                successful += 1
-                # Save individual result
-                output_file = output_path / f"{result['doc_id']}.json"
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
-            else:
-                failed += 1
-        
-        # Save batch summary
-        summary = {
-            "total_documents": len(pdf_files),
-            "successful": successful,
-            "failed": failed,
-            "success_rate": successful / len(pdf_files) if pdf_files else 0,
-            "average_processing_time": sum(
-                r['processing_time_sec'] for r in results
-            ) / len(results),
-            "average_cost": sum(
-                r.get('cost_estimate_usd', 0) for r in results
-            ) / len(results),
-            "average_confidence": sum(
-                r.get('confidence', 0) for r in results if 'confidence' in r
-            ) / successful if successful > 0 else 0,
-            "results": results
-        }
-        
-        summary_file = output_path / "batch_summary.json"
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(summary, f, indent=2, ensure_ascii=False)
-        
-        print("\n" + "=" * 60)
-        print(f"\n📈 BATCH PROCESSING COMPLETE")
-        print(f"   Total Documents: {len(pdf_files)}")
-        print(f"   Successful: {successful} ({successful/len(pdf_files)*100:.1f}%)")
-        print(f"   Failed: {failed}")
-        print(f"   Avg Confidence: {summary['average_confidence']:.2%}")
-        print(f"   Avg Processing Time: {summary['average_processing_time']:.2f}s")
-        print(f"   Avg Cost: ${summary['average_cost']:.6f}")
-        print(f"\n💾 Results saved to: {output_path}")
+from config import CHECKPOINT_DIR
+from utils.preprocessing import DocumentPreprocessor
+from utils.teacher_extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+from inference.sgan_extractor import SGANExtractor
+from inference.ensemble_inference import InferenceEnsemble
+from inference.validator import FieldValidator
 
 
-def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description='Invoice Field Extraction System'
+def train_mode():
+    """Training mode: Train SGAN from scratch using pseudo-labels"""
+    logging.info("="*60)
+    logging.info("TRAINING MODE")
+    logging.info("="*60)
+    
+    from training.train_pipeline import train_sgan_model, get_image_paths
+    
+    # Get training data
+    data_dir = Path("data")
+    image_paths = get_image_paths(data_dir)
+    
+    if not image_paths:
+        logging.error(f"No images found in {data_dir}")
+        logging.info("Please add training images to data/ directory")
+        return None
+    
+    logging.info(f"Found {len(image_paths)} training images")
+    
+    # Initialize components
+    preprocessor = DocumentPreprocessor()
+    vlm = VLMExtractor()
+    ocr = OCRExtractor()
+    cv = CVExtractor()
+    teacher_ensemble = TeacherEnsemble(vlm, ocr, cv)
+    
+    # Train
+    trained_model = train_sgan_model(
+        image_paths,
+        teacher_ensemble,
+        preprocessor,
+        num_iterations=3
+    )
+    
+    logging.info(f"\nModel saved to {CHECKPOINT_DIR}")
+    return trained_model
+
+
+def inference_mode(image_path: str):
+    """Inference mode: Use trained SGAN with validation"""
+    logging.info("="*60)
+    logging.info("INFERENCE MODE")
+    logging.info("="*60)
+    
+    # Check if model exists
+    checkpoint_path = CHECKPOINT_DIR / "iteration_3" / "best_model.pt"
+    
+    if not checkpoint_path.exists():
+        logging.error(f"Model not found at {checkpoint_path}")
+        logging.info("Please run training first: python main.py --mode train")
+        return None
+    
+    # Load SGAN (student model)
+    sgan = SGANExtractor(checkpoint_path=str(checkpoint_path))
+    
+    # Load fallback extractors (teachers)
+    vlm = VLMExtractor()
+    ocr = OCRExtractor()
+    cv = CVExtractor()
+    
+    # Create inference ensemble
+    ensemble = InferenceEnsemble(
+        sgan_extractor=sgan,
+        vlm_extractor=vlm,
+        ocr_extractor=ocr,
+        cv_extractor=cv
+    )
+    
+    # Preprocess document
+    preprocessor = DocumentPreprocessor()
+    
+    logging.info(f"\nProcessing: {image_path}")
+    processed = preprocessor.process(image_path)
+    
+    if not processed['images']:
+        logging.error("Failed to process image")
+        return None
+    
+    # Extract fields (adaptive strategy)
+    logging.info("Extracting fields...")
+    results = ensemble.extract_standard(
+        images=processed["images"],
+        language=processed["language"]
+    )
+    
+    # Validate and normalize
+    validator = FieldValidator()
+    validated_results = validator.validate(results, processed['language'])
+    
+    # Display results
+    logging.info("\n" + "="*60)
+    logging.info("EXTRACTION RESULTS")
+    logging.info("="*60)
+    
+    logging.info(f"\nMetadata:")
+    if '_metadata' in results:
+        for key, value in results['_metadata'].items():
+            logging.info(f"  {key}: {value}")
+    
+    logging.info(f"\nExtracted Fields:")
+    for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
+        if field in validated_results:
+            val = validated_results[field]['value']
+            conf = validated_results[field]['confidence']
+            logging.info(f"  {field}: {val} (confidence: {conf:.2f})")
+    
+    logging.info(f"\nVisual Elements:")
+    for field in ['signature', 'stamp']:
+        if field in validated_results:
+            present = validated_results[field]['present']
+            conf = validated_results[field]['confidence']
+            logging.info(f"  {field}: {'✓' if present else '✗'} (confidence: {conf:.2f})")
+    
+    logging.info(f"\nOverall Confidence: {validated_results['overall_confidence']:.2f}")
+    
+    return validated_results
+
+
+def demo_mode():
+    """Demo mode: Show complete workflow"""
+    logging.info("="*60)
+    logging.info("DEMO MODE - Complete Workflow")
+    logging.info("="*60)
+    
+    # Check for sample data
+    sample_image = Path("data/sample_invoice.jpg")
+    
+    if not sample_image.exists():
+        logging.warning(f"Sample image not found at {sample_image}")
+        logging.info("\nDemo workflow:")
+        logging.info("1. Add training images to data/ directory")
+        logging.info("2. Run: python main.py --mode train")
+        logging.info("3. Run: python main.py --mode inference --image path/to/invoice.jpg")
+        return
+    
+    # Check if model trained
+    checkpoint_path = CHECKPOINT_DIR / "iteration_3" / "best_model.pt"
+    
+    if not checkpoint_path.exists():
+        logging.info("\nStep 1: Training model...")
+        train_mode()
+    else:
+        logging.info("\nModel already trained ✓")
+    
+    # Run inference
+    logging.info("\nStep 2: Running inference...")
+    results = inference_mode(str(sample_image))
+    
+    if results:
+        logging.info("\nDemo complete! ✓")
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Document Extraction System")
+    parser.add_argument(
+        '--mode',
+        choices=['train', 'inference', 'demo'],
+        default='demo',
+        help='Operation mode'
     )
     parser.add_argument(
-        '--input',
-        '-i',
-        required=True,
-        help='Input PDF file or directory'
-    )
-    parser.add_argument(
-        '--output',
-        '-o',
-        default='output',
-        help='Output directory for results (default: output)'
-    )
-    parser.add_argument(
-        '--config',
-        '-c',
-        default='config/model_config.yaml',
-        help='Path to configuration file'
+        '--image',
+        type=str,
+        help='Path to image file (for inference mode)'
     )
     
     args = parser.parse_args()
     
-    # Initialize pipeline
-    pipeline = InvoiceExtractionPipeline(config_path=args.config)
+    try:
+        if args.mode == 'train':
+            train_mode()
+        elif args.mode == 'inference':
+            if not args.image:
+                logging.error("--image required for inference mode")
+                sys.exit(1)
+            inference_mode(args.image)
+        else:  # demo
+            demo_mode()
     
-    # Check if input is file or directory
-    input_path = Path(args.input)
-    
-    if input_path.is_file():
-        # Process single file
-        result = pipeline.process_document(str(input_path))
-        
-        # Save result
-        output_path = Path(args.output)
-        output_path.mkdir(parents=True, exist_ok=True)
-        output_file = output_path / f"{result['doc_id']}.json"
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n💾 Result saved to: {output_file}")
-        
-    elif input_path.is_dir():
-        # Process batch
-        pipeline.process_batch(str(input_path), args.output)
-    else:
-        print(f"❌ Error: {args.input} is not a valid file or directory")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+    except KeyboardInterrupt:
+        logging.info("\nInterrupted by user")
+    except Exception as e:
+        logging.error(f"Error: {e}", exc_info=True)

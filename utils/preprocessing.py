@@ -1,21 +1,20 @@
 """
 Document Preprocessing Module
-Handles PDF conversion, image enhancement, and quality assessment
+Handles image loading, enhancement, and quality assessment
 """
 
 import cv2
 import numpy as np
 from PIL import Image
-import pdf2image
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 import fasttext
-from skimage import measure
+from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
 
 class DocumentPreprocessor:
-    """Preprocessing pipeline for invoice documents"""
+    """Preprocessing pipeline for invoice document images"""
     
     def __init__(self):
         """Initialize preprocessor with quality assessment model"""
@@ -26,18 +25,21 @@ class DocumentPreprocessor:
             print("⚠️  Language detection model not found, using fallback")
             self.lang_model = None
     
-    def process(self, pdf_path: str) -> Dict[str, Any]:
+    def process(self, image_path: Union[str, Path]) -> Dict[str, Any]:
         """
-        Main preprocessing pipeline
+        Main preprocessing pipeline for image files
         
         Args:
-            pdf_path: Path to PDF file
+            image_path: Path to image file (PNG, JPG, etc.)
             
         Returns:
             Dictionary with processed images and metadata
         """
-        # Convert PDF to images
-        images = self.pdf_to_images(pdf_path)
+        # Load image
+        images = self.load_images(image_path)
+        
+        if not images:
+            raise ValueError(f"Failed to load image from {image_path}")
         
         # Assess quality
         quality_score = self.assess_quality(images[0])
@@ -55,30 +57,51 @@ class DocumentPreprocessor:
             'num_pages': len(enhanced_images)
         }
     
-    def pdf_to_images(self, pdf_path: str, dpi: int = 300) -> List[np.ndarray]:
+    def load_images(self, image_path: Union[str, Path]) -> List[np.ndarray]:
         """
-        Convert PDF to high-resolution images
+        Load image file(s)
         
         Args:
-            pdf_path: Path to PDF
-            dpi: Resolution for conversion
+            image_path: Path to image file or directory
             
         Returns:
             List of images as numpy arrays
         """
         try:
-            pil_images = pdf2image.convert_from_path(
-                pdf_path,
-                dpi=dpi,
-                fmt='png'
-            )
+            path = Path(image_path)
             
-            # Convert PIL to numpy arrays
-            images = [np.array(img) for img in pil_images]
+            # If it's a directory, load all images
+            if path.is_dir():
+                images = []
+                valid_extensions = {'.png', '.jpg', '.jpeg', '.tiff', '.tif', '.bmp'}
+                
+                for img_file in sorted(path.glob('*')):
+                    if img_file.suffix.lower() in valid_extensions:
+                        img = cv2.imread(str(img_file))
+                        if img is not None:
+                            # Convert BGR to RGB
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                            images.append(img)
+                
+                return images
             
-            return images
+            # Single image file
+            elif path.is_file():
+                img = cv2.imread(str(path))
+                if img is not None:
+                    # Convert BGR to RGB
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return [img]
+                else:
+                    # Try with PIL as fallback
+                    pil_img = Image.open(str(path))
+                    img = np.array(pil_img.convert('RGB'))
+                    return [img]
+            
+            return []
+            
         except Exception as e:
-            print(f"Error converting PDF: {e}")
+            print(f"Error loading image: {e}")
             return []
     
     def assess_quality(self, image: np.ndarray) -> float:
@@ -143,22 +166,23 @@ class DocumentPreprocessor:
             # Denoise
             denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
             
-            # Adaptive thresholding for better text clarity
-            enhanced = cv2.adaptiveThreshold(
-                denoised,
-                255,
-                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY,
-                11,
-                2
-            )
+            # Adaptive histogram equalization for better contrast
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(denoised)
+            
+            # Sharpen the image
+            kernel = np.array([[-1, -1, -1],
+                             [-1,  9, -1],
+                             [-1, -1, -1]])
+            enhanced = cv2.filter2D(enhanced, -1, kernel)
             
             # Convert back to RGB for consistency
             if len(image.shape) == 3:
                 enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
             
             return enhanced
-        except:
+        except Exception as e:
+            print(f"Error enhancing image: {e}")
             return image
     
     def deskew(self, image: np.ndarray) -> np.ndarray:
@@ -190,26 +214,29 @@ class DocumentPreprocessor:
                 if angles:
                     median_angle = np.median(angles)
                     
-                    # Rotate image
-                    (h, w) = image.shape[:2]
-                    center = (w // 2, h // 2)
-                    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
-                    rotated = cv2.warpAffine(
-                        image,
-                        M,
-                        (w, h),
-                        flags=cv2.INTER_CUBIC,
-                        borderMode=cv2.BORDER_REPLICATE
-                    )
-                    return rotated
+                    # Only rotate if angle is significant (> 0.5 degrees)
+                    if abs(median_angle) > 0.5:
+                        # Rotate image
+                        (h, w) = image.shape[:2]
+                        center = (w // 2, h // 2)
+                        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                        rotated = cv2.warpAffine(
+                            image,
+                            M,
+                            (w, h),
+                            flags=cv2.INTER_CUBIC,
+                            borderMode=cv2.BORDER_REPLICATE
+                        )
+                        return rotated
             
             return image
-        except:
+        except Exception as e:
+            print(f"Error deskewing image: {e}")
             return image
     
     def detect_language(self, image: np.ndarray) -> str:
         """
-        Detect document language
+        Detect document language (simplified for images)
         
         Args:
             image: Input image
@@ -221,11 +248,36 @@ class DocumentPreprocessor:
             if self.lang_model is None:
                 return "en"  # Default to English
             
-            # Simple heuristic: check for Unicode ranges
-            # This is a fallback when fasttext is not available
+            # For image-based detection, we would need OCR first
+            # This is a simplified version - in production, 
+            # extract text with OCR and then detect language
             
-            # For now, return English as default
-            # In production, use OCR + fasttext on extracted text
-            return "en"
+            # Check for common Indian scripts by analyzing Unicode ranges
+            # after OCR (simplified here)
+            
+            return "en"  # Default to English for now
         except:
             return "en"
+    
+    def batch_process(self, image_paths: List[Union[str, Path]]) -> List[Dict[str, Any]]:
+        """
+        Process multiple images in batch
+        
+        Args:
+            image_paths: List of paths to image files
+            
+        Returns:
+            List of processed results
+        """
+        results = []
+        
+        for image_path in image_paths:
+            try:
+                result = self.process(image_path)
+                result['image_path'] = str(image_path)
+                results.append(result)
+            except Exception as e:
+                print(f"Failed to process {image_path}: {e}")
+                continue
+        
+        return results
