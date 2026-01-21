@@ -8,14 +8,14 @@ import re
 import numpy as np
 from typing import List, Dict, Any, Optional
 import cv2
-from paddleocr import PaddleOCR
+from easyocr import easyocr
 from PIL import Image
 import torch
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 import warnings
 import json
 warnings.filterwarnings('ignore')
-import cv2
+
 
 class VLMExtractor:
     """Vision-Language Model (Teacher for pseudo-label generation)"""
@@ -38,31 +38,23 @@ class VLMExtractor:
         print(f"    Teacher VLM loaded on {self.device}")
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Extract fields using VLM (robust version with debug)"""
+        """Extract fields using VLM"""
         try:
             if not images:
-                print("    VLM extraction: No images provided.")
                 return self._get_empty()
-
-            # Convert images to PIL
+            
             pil_images = []
-            for idx, img in enumerate(images):
+            for img in images:
                 if img is None:
-                    print(f"    VLM extraction: Image {idx} is None, skipping.")
                     continue
-                try:
-                    if img.dtype == np.uint8:
-                        pil_images.append(Image.fromarray(img))
-                    else:
-                        pil_images.append(Image.fromarray((img * 255).astype(np.uint8)))
-                except Exception as e:
-                    print(f"    VLM extraction: Failed to convert image {idx} -> PIL: {e}")
-
+                if img.dtype == np.uint8:
+                    pil_images.append(Image.fromarray(img))
+                else:
+                    pil_images.append(Image.fromarray((img * 255).astype(np.uint8)))
+            
             if not pil_images:
-                print("    VLM extraction: No valid PIL images.")
                 return self._get_empty()
-
-            # Prepare the prompt
+            
             messages = [
                 {
                     "role": "user",
@@ -91,64 +83,32 @@ class VLMExtractor:
                 tokenize=False,
                 add_generation_prompt=True
             )
-            if prompt is None:
-                print("    VLM extraction: apply_chat_template returned None.")
-                return self._get_empty()
 
-            # Process inputs
-            try:
-                inputs = self.processor(
-                    text=[prompt],
-                    images=pil_images,
-                    return_tensors="pt",
-                    padding=True
-                )
-            except Exception as e:
-                print(f"    VLM extraction: processor failed -> {e}")
-                return self._get_empty()
+            inputs = self.processor(
+                text=[prompt],
+                images=pil_images,
+                return_tensors="pt",
+                padding=True
+            ).to(self.device)
 
-            if inputs is None or "input_ids" not in inputs or "pixel_values" not in inputs:
-                print("    VLM extraction: processor returned invalid inputs.")
-                return self._get_empty()
-
-            inputs = inputs.to(self.device)
             inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
 
-            # Generate output
-            try:
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        max_new_tokens=512
-                    )
-            except Exception as e:
-                print(f"    VLM extraction: model.generate failed -> {e}")
-                return self._get_empty()
-
-            if output_ids is None:
-                print("    VLM extraction: model.generate returned None.")
-                return self._get_empty()
-
-            # Decode
-            try:
-                generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
-            except Exception as e:
-                print(f"    VLM extraction: batch_decode failed -> {e}")
-                return self._get_empty()
-
-            if not generated_text:
-                print("    VLM extraction: generated_text is empty.")
-                return self._get_empty()
-
-            # Parse JSON
+            
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=512
+                )
+            
+            generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            
             return self._parse_response(generated_text)
-
+        
         except Exception as e:
-            print(f"    VLM extraction unexpected error: {e}")
+            print(f"    VLM extraction error: {e}")
             return self._get_empty()
-
     
     def _parse_response(self, response: str) -> Dict[str, Any]:
         try:
@@ -196,11 +156,14 @@ class VLMExtractor:
 
 
 class OCRExtractor:
-    """OCR-based extractor (Teacher for pseudo-label generation)"""
+    """OCR-based extractor using EasyOCR (Teacher for pseudo-label generation)"""
     
     def __init__(self):
-        print("    Loading Teacher OCR (PaddleOCR)...")
-        self.ocr = PaddleOCR(use_angle_cls=False, lang='en')
+        print("    Loading Teacher OCR (EasyOCR)...")
+        # Initialize EasyOCR with English language
+        # Set gpu=True if CUDA is available, gpu=False otherwise
+        self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+        print(f"    EasyOCR loaded (GPU: {torch.cuda.is_available()})")
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
         """Extract fields using OCR + regex"""
@@ -215,16 +178,14 @@ class OCRExtractor:
                     continue
                 
                 try:
-                    result = self.ocr.ocr(image)
-                    if not result or result[0] is None:
-                        continue
-                    for line in result[0]:
-                        if line is None or len(line) < 2:
-                            continue
+                    # EasyOCR readtext returns: (bbox, text, confidence)
+                    results = self.reader.readtext(image)
+                    
+                    for (bbox, text, confidence) in results:
                         all_text.append({
-                            'text': line[1][0],
-                            'confidence': float(line[1][1]),
-                            'bbox': line[0]
+                            'text': text,
+                            'confidence': float(confidence),
+                            'bbox': bbox  # EasyOCR bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
                         })
                 except Exception as e:
                     print(f"    OCR error on image: {e}")

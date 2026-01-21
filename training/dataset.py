@@ -153,26 +153,22 @@ class PseudoLabelDataset(Dataset):
     def _extract_ocr_tokens(self, image: np.ndarray) -> Tuple[List[str], List[List[float]]]:
         """Extract tokens and bboxes using OCR"""
         try:
-            # Use teacher OCR
-            result = self.teacher_ensemble.ocr.ocr.ocr(image, cls=True)
+            # Use teacher EasyOCR
+            results = self.teacher_ensemble.ocr.reader.readtext(image)
             
             tokens = []
             bboxes = []
             
-            if result and result[0]:
+            if results:
                 img_h, img_w = image.shape[:2]
                 
-                for line in result[0]:
-                    if line is None or len(line) < 2:
-                        continue
-                    
-                    text = line[1][0]
-                    bbox = line[0]
+                for (bbox, text, confidence) in results:
+                    # EasyOCR bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                    # Extract all x and y coordinates
+                    x_coords = [point[0] for point in bbox]
+                    y_coords = [point[1] for point in bbox]
                     
                     # Normalize bbox
-                    x_coords = [p[0] for p in bbox]
-                    y_coords = [p[1] for p in bbox]
-                    
                     x1, x2 = min(x_coords) / img_w, max(x_coords) / img_w
                     y1, y2 = min(y_coords) / img_h, max(y_coords) / img_h
                     
