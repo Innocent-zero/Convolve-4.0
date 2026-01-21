@@ -15,7 +15,7 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 import warnings
 import json
 warnings.filterwarnings('ignore')
-
+import cv2
 
 class VLMExtractor:
     """Vision-Language Model (Teacher for pseudo-label generation)"""
@@ -38,59 +38,117 @@ class VLMExtractor:
         print(f"    Teacher VLM loaded on {self.device}")
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Extract fields using VLM"""
-        pil_images = [Image.fromarray(img) if img.dtype == np.uint8 else Image.fromarray((img * 255).astype(np.uint8)) for img in images]
-        
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {
-                        "type": "text",
-                        "text": (
-                            "Extract the following from this invoice/quotation in JSON format:\n"
-                            "{\n"
-                            '  "dealer_name": {"value": "...", "confidence": 0.0-1.0},\n'
-                            '  "model_name": {"value": "...", "confidence": 0.0-1.0},\n'
-                            '  "horse_power": {"value": number, "confidence": 0.0-1.0},\n'
-                            '  "asset_cost": {"value": number, "confidence": 0.0-1.0},\n'
-                            '  "signature": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0},\n'
-                            '  "stamp": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0}\n'
-                            "}"
-                        )
-                    }
-                ]
-            }
-        ]
+        """Extract fields using VLM (robust version with debug)"""
+        try:
+            if not images:
+                print("    VLM extraction: No images provided.")
+                return self._get_empty()
 
-        prompt = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+            # Convert images to PIL
+            pil_images = []
+            for idx, img in enumerate(images):
+                if img is None:
+                    print(f"    VLM extraction: Image {idx} is None, skipping.")
+                    continue
+                try:
+                    if img.dtype == np.uint8:
+                        pil_images.append(Image.fromarray(img))
+                    else:
+                        pil_images.append(Image.fromarray((img * 255).astype(np.uint8)))
+                except Exception as e:
+                    print(f"    VLM extraction: Failed to convert image {idx} -> PIL: {e}")
 
-        inputs = self.processor(
-            text=[prompt],
-            images=pil_images,
-            return_tensors="pt",
-            padding=True
-        ).to(self.device)
+            if not pil_images:
+                print("    VLM extraction: No valid PIL images.")
+                return self._get_empty()
 
-        inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+            # Prepare the prompt
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": (
+                                "Extract the following from this invoice/quotation in JSON format:\n"
+                                "{\n"
+                                '  "dealer_name": {"value": "...", "confidence": 0.0-1.0},\n'
+                                '  "model_name": {"value": "...", "confidence": 0.0-1.0},\n'
+                                '  "horse_power": {"value": number, "confidence": 0.0-1.0},\n'
+                                '  "asset_cost": {"value": number, "confidence": 0.0-1.0},\n'
+                                '  "signature": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0},\n'
+                                '  "stamp": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0}\n'
+                                "}"
+                            )
+                        }
+                    ]
+                }
+            ]
 
-        
-        with torch.no_grad():
-            output_ids = self.model.generate(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=512
-        )
-        
-        generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
-        
-        return self._parse_response(generated_text)
+            prompt = self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            if prompt is None:
+                print("    VLM extraction: apply_chat_template returned None.")
+                return self._get_empty()
+
+            # Process inputs
+            try:
+                inputs = self.processor(
+                    text=[prompt],
+                    images=pil_images,
+                    return_tensors="pt",
+                    padding=True
+                )
+            except Exception as e:
+                print(f"    VLM extraction: processor failed -> {e}")
+                return self._get_empty()
+
+            if inputs is None or "input_ids" not in inputs or "pixel_values" not in inputs:
+                print("    VLM extraction: processor returned invalid inputs.")
+                return self._get_empty()
+
+            inputs = inputs.to(self.device)
+            inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
+
+            # Generate output
+            try:
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"],
+                        max_new_tokens=512
+                    )
+            except Exception as e:
+                print(f"    VLM extraction: model.generate failed -> {e}")
+                return self._get_empty()
+
+            if output_ids is None:
+                print("    VLM extraction: model.generate returned None.")
+                return self._get_empty()
+
+            # Decode
+            try:
+                generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            except Exception as e:
+                print(f"    VLM extraction: batch_decode failed -> {e}")
+                return self._get_empty()
+
+            if not generated_text:
+                print("    VLM extraction: generated_text is empty.")
+                return self._get_empty()
+
+            # Parse JSON
+            return self._parse_response(generated_text)
+
+        except Exception as e:
+            print(f"    VLM extraction unexpected error: {e}")
+            return self._get_empty()
+
     
     def _parse_response(self, response: str) -> Dict[str, Any]:
         try:
@@ -142,26 +200,41 @@ class OCRExtractor:
     
     def __init__(self):
         print("    Loading Teacher OCR (PaddleOCR)...")
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
+        self.ocr = PaddleOCR(use_angle_cls=False, lang='en')
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
         """Extract fields using OCR + regex"""
-        all_text = []
-        
-        for image in images:
-            result = self.ocr.ocr(image, cls=True)
-            if not result or result[0] is None:
-                continue
-            for line in result[0]:
-                if line is None or len(line) < 2:
+        try:
+            if not images:
+                return self._get_empty()
+            
+            all_text = []
+            
+            for image in images:
+                if image is None:
                     continue
-                all_text.append({
-                    'text': line[1][0],
-                    'confidence': float(line[1][1]),
-                    'bbox': line[0]
-                })
+                
+                try:
+                    result = self.ocr.ocr(image)
+                    if not result or result[0] is None:
+                        continue
+                    for line in result[0]:
+                        if line is None or len(line) < 2:
+                            continue
+                        all_text.append({
+                            'text': line[1][0],
+                            'confidence': float(line[1][1]),
+                            'bbox': line[0]
+                        })
+                except Exception as e:
+                    print(f"    OCR error on image: {e}")
+                    continue
 
-        return self._extract_fields(all_text)
+            return self._extract_fields(all_text)
+        
+        except Exception as e:
+            print(f"    OCR extraction error: {e}")
+            return self._get_empty()
     
     def _extract_fields(self, text_blocks: List[Dict]) -> Dict[str, Any]:
         full_text = ' '.join([t['text'] for t in text_blocks])
@@ -189,6 +262,16 @@ class OCRExtractor:
         extracted['stamp'] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.5}
         
         return extracted
+    
+    def _get_empty(self) -> Dict[str, Any]:
+        return {
+            'dealer_name': {'value': None, 'confidence': 0.0},
+            'model_name': {'value': None, 'confidence': 0.0},
+            'horse_power': {'value': None, 'confidence': 0.0},
+            'asset_cost': {'value': None, 'confidence': 0.0},
+            'signature': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0},
+            'stamp': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+        }
 
 
 class CVExtractor:
@@ -209,21 +292,28 @@ class CVExtractor:
     
     def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
         """Extract visual elements"""
-        if self.use_yolo:
-            signature_result = self._detect_with_yolo(images[0], 'signature')
-            stamp_result = self._detect_with_yolo(images[0], 'stamp')
-        else:
-            signature_result = self._detect_signature_traditional(images[0])
-            stamp_result = self._detect_stamp_traditional(images[0])
-        
-        return {
-            'dealer_name': {'value': None, 'confidence': 0.0},
-            'model_name': {'value': None, 'confidence': 0.0},
-            'horse_power': {'value': None, 'confidence': 0.0},
-            'asset_cost': {'value': None, 'confidence': 0.0},
-            'signature': signature_result,
-            'stamp': stamp_result
-        }
+        try:
+            if not images or images[0] is None:
+                return self._get_empty()
+            
+            if self.use_yolo:
+                signature_result = self._detect_with_yolo(images[0], 'signature')
+                stamp_result = self._detect_with_yolo(images[0], 'stamp')
+            else:
+                signature_result = self._detect_signature_traditional(images[0])
+                stamp_result = self._detect_stamp_traditional(images[0])
+            
+            return {
+                'dealer_name': {'value': None, 'confidence': 0.0},
+                'model_name': {'value': None, 'confidence': 0.0},
+                'horse_power': {'value': None, 'confidence': 0.0},
+                'asset_cost': {'value': None, 'confidence': 0.0},
+                'signature': signature_result,
+                'stamp': stamp_result
+            }
+        except Exception as e:
+            print(f"    CV extraction error: {e}")
+            return self._get_empty()
     
     def _detect_signature_traditional(self, image: np.ndarray) -> Dict[str, Any]:
         """Detect signature using traditional CV"""
@@ -312,6 +402,16 @@ class CVExtractor:
             return {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
         except:
             return {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+    
+    def _get_empty(self) -> Dict[str, Any]:
+        return {
+            'dealer_name': {'value': None, 'confidence': 0.0},
+            'model_name': {'value': None, 'confidence': 0.0},
+            'horse_power': {'value': None, 'confidence': 0.0},
+            'asset_cost': {'value': None, 'confidence': 0.0},
+            'signature': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0},
+            'stamp': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+        }
 
 
 class TeacherEnsemble:
@@ -331,10 +431,31 @@ class TeacherEnsemble:
         images: List[np.ndarray],
         language: str
     ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-        """Generate pseudo-labels from all three teachers"""
-        vlm_results = self.vlm.extract(images, language) or {}
-        ocr_results = self.ocr.extract(images, language) or {}
-        cv_results  = self.cv.extract(images, language)  or {}
+        """Generate pseudo-labels from all three teachers - RETURNS DICTS NOT NONE"""
+        try:
+            vlm_results = self.vlm.extract(images, language)
+            if vlm_results is None:
+                vlm_results = self.vlm._get_empty()
+        except Exception as e:
+            print(f"    VLM extraction failed: {e}")
+            vlm_results = self.vlm._get_empty()
+        
+        try:
+            ocr_results = self.ocr.extract(images, language)
+            if ocr_results is None:
+                ocr_results = self.ocr._get_empty()
+        except Exception as e:
+            print(f"    OCR extraction failed: {e}")
+            ocr_results = self.ocr._get_empty()
+        
+        try:
+            cv_results = self.cv.extract(images, language)
+            if cv_results is None:
+                cv_results = self.cv._get_empty()
+        except Exception as e:
+            print(f"    CV extraction failed: {e}")
+            cv_results = self.cv._get_empty()
+        
         return vlm_results, ocr_results, cv_results
     
     def merge_predictions(
@@ -381,7 +502,8 @@ class TeacherEnsemble:
                         best_detection = result[field]
             
             merged[field] = best_detection if best_detection else {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
-        # Determine validity instead of returning None
+        
+        # Determine validity
         has_any_text = any(
             merged[f]['value'] is not None
             for f in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']

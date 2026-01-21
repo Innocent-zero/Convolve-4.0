@@ -71,24 +71,39 @@ class PseudoLabelDataset(Dataset):
                 
                 # Preprocess
                 processed = self.preprocessor.process(img_path)
-                images = processed['images']
+                images = processed.get('images', [])
                 
                 if not images:
                     logging.warning(f"No images from: {img_path}")
                     continue
                 
-                # Get predictions from all teachers
-                vlm_results, ocr_results, cv_results = self.teacher_ensemble.generate_pseudo_labels(
-                    images, processed['language']
-                )
+                # Get predictions from all teachers - ADD NULL CHECKS
+                try:
+                    vlm_results, ocr_results, cv_results = self.teacher_ensemble.generate_pseudo_labels(
+                        images, processed.get('language', 'en')
+                    )
+                except Exception as e:
+                    logging.warning(f"Teacher ensemble failed for {img_path}: {e}")
+                    continue
+                
+                # CRITICAL FIX: Check if results are None
+                if vlm_results is None or ocr_results is None or cv_results is None:
+                    logging.warning(f"Got None results from teachers for {img_path}")
+                    continue
                 
                 # Merge results
-                merged_results = self.teacher_ensemble.merge_predictions(
-                    vlm_results, ocr_results, cv_results
-                )
-                if not merged_results.get('valid', False):
+                try:
+                    merged_results = self.teacher_ensemble.merge_predictions(
+                        vlm_results, ocr_results, cv_results
+                    )
+                except Exception as e:
+                    logging.warning(f"Failed to merge predictions for {img_path}: {e}")
+                    continue
+                
+                if not merged_results or not merged_results.get('valid', False):
                     logging.warning(f"Skipping unusable sample: {img_path}")
-                    return self._empty_sample()
+                    continue
+                
                 # Check consensus and confidence
                 field_labels = {}
                 field_confidences = {}
@@ -97,14 +112,15 @@ class PseudoLabelDataset(Dataset):
                     # Count extractors that found this field
                     extracted_values = []
                     for result in [vlm_results, ocr_results, cv_results]:
-                        if field in result and result[field]['value'] is not None:
+                        if result and field in result and result[field].get('value') is not None:
                             extracted_values.append(result[field]['value'])
                     
                     # Check consensus
                     if len(extracted_values) >= self.consensus_requirement:
-                        if merged_results[field]['confidence'] >= self.confidence_threshold:
+                        field_conf = merged_results[field].get('confidence', 0.0)
+                        if field_conf >= self.confidence_threshold:
                             field_labels[field] = merged_results[field]['value']
-                            field_confidences[field] = merged_results[field]['confidence']
+                            field_confidences[field] = field_conf
                 
                 # Only include if we have critical fields
                 required_fields = ['dealer_name', 'model_name', 'asset_cost']
@@ -128,6 +144,8 @@ class PseudoLabelDataset(Dataset):
             
             except Exception as e:
                 logging.warning(f"Failed pseudo-label for {img_path}: {e}")
+                import traceback
+                logging.debug(traceback.format_exc())
                 continue
         
         return samples
@@ -145,6 +163,9 @@ class PseudoLabelDataset(Dataset):
                 img_h, img_w = image.shape[:2]
                 
                 for line in result[0]:
+                    if line is None or len(line) < 2:
+                        continue
+                    
                     text = line[1][0]
                     bbox = line[0]
                     
