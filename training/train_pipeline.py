@@ -10,8 +10,6 @@ import logging
 
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from config import (
     VOCAB_SIZE, D_MODEL, NUM_HEADS, NUM_LAYERS,
     NUM_EPOCHS_INITIAL, NUM_EPOCHS_ITERATION,
@@ -81,7 +79,7 @@ def train_sgan_model(
         logging.info(f"{'='*60}")
         
         # Limit images for first iteration (demo purposes)
-        max_images = 100 if iteration == 0 else len(image_paths)
+        max_images = 10 if iteration == 0 else len(image_paths)
         iter_image_paths = image_paths[:max_images]
         
         # Generate pseudo-labels
@@ -91,7 +89,12 @@ def train_sgan_model(
             preprocessor,
             confidence_threshold=threshold
         )
-        
+        print("DATASET TYPE:", type(dataset))
+        print("DATASET CLASS:", dataset.__class__)
+        print("DATASET MODULE:", dataset.__class__.__module__)
+        print("HAS __len__:", hasattr(dataset, "__len__"))
+        print("DIR CONTAINS __len__:", "__len__" in dir(dataset))
+
         if len(dataset) == 0:
             logging.warning("No samples generated! Check your data.")
             break
@@ -108,19 +111,23 @@ def train_sgan_model(
         
         train_loader = DataLoader(
             train_dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=2,
-            persistent_workers=True
+            batch_size=5,
+            shuffle=(len(train_dataset) > 1),
+            num_workers=0,          # 🔴 CRITICAL
+            pin_memory=False
         )
+
         
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=2,
-            persistent_workers=True
-        )
+        val_loader = None
+        if val_dataset is not None and len(val_dataset) > 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=5,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False
+            )
+
         
         # Train
         num_epochs = NUM_EPOCHS_INITIAL if iteration == 0 else NUM_EPOCHS_ITERATION
@@ -149,7 +156,7 @@ if __name__ == "__main__":
     
     # Import here to avoid circular dependencies
     from utils.preprocessing import DocumentPreprocessor
-    from utils.extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+    from utils.extractors import OCRExtractor, CVExtractor, TeacherEnsemble
     
     # Get image paths
     data_dir = Path("data")
@@ -161,12 +168,11 @@ if __name__ == "__main__":
     
     logging.info(f"Found {len(image_paths)} images")
     
-    # Initialize teachers and preprocessor
+    # Initialize teachers and preprocessor (NO LayoutLMv3)
     preprocessor = DocumentPreprocessor()
-    vlm = VLMExtractor()
     ocr = OCRExtractor()
     cv = CVExtractor()
-    teacher_ensemble = TeacherEnsemble(vlm, ocr, cv)
+    teacher_ensemble = TeacherEnsemble(ocr, cv)  # Only OCR + CV
     
     # Train
     trained_model = train_sgan_model(

@@ -12,8 +12,6 @@ from tqdm import tqdm
 import logging
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from config import CONSENSUS_REQUIREMENT, MAX_TOKENS
 
 
@@ -77,24 +75,24 @@ class PseudoLabelDataset(Dataset):
                     logging.warning(f"No images from: {img_path}")
                     continue
                 
-                # Get predictions from all teachers - ADD NULL CHECKS
+                # Get predictions from OCR + CV only (2 teachers)
                 try:
-                    vlm_results, ocr_results, cv_results = self.teacher_ensemble.generate_pseudo_labels(
+                    ocr_results, cv_results = self.teacher_ensemble.generate_pseudo_labels(
                         images, processed.get('language', 'en')
                     )
                 except Exception as e:
                     logging.warning(f"Teacher ensemble failed for {img_path}: {e}")
                     continue
                 
-                # CRITICAL FIX: Check if results are None
-                if vlm_results is None or ocr_results is None or cv_results is None:
+                # Check if results are None
+                if ocr_results is None or cv_results is None:
                     logging.warning(f"Got None results from teachers for {img_path}")
                     continue
                 
                 # Merge results
                 try:
                     merged_results = self.teacher_ensemble.merge_predictions(
-                        vlm_results, ocr_results, cv_results
+                        ocr_results, cv_results
                     )
                 except Exception as e:
                     logging.warning(f"Failed to merge predictions for {img_path}: {e}")
@@ -104,33 +102,31 @@ class PseudoLabelDataset(Dataset):
                     logging.warning(f"Skipping unusable sample: {img_path}")
                     continue
                 
-                # Check consensus and confidence
+                # Adjusted consensus: with only 2 teachers (OCR, CV)
+                # For text/numeric: OCR is authoritative (consensus = 1)
+                # For visual: CV is authoritative (consensus = 1)
                 field_labels = {}
                 field_confidences = {}
                 
                 for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
-                    # Count extractors that found this field
-                    extracted_values = []
-                    for result in [vlm_results, ocr_results, cv_results]:
-                        if result and field in result and result[field].get('value') is not None:
-                            extracted_values.append(result[field]['value'])
-                    
-                    # Check consensus
-                    if len(extracted_values) >= self.consensus_requirement:
+                    # OCR provides these fields
+                    if field in merged_results and merged_results[field].get('value') is not None:
                         field_conf = merged_results[field].get('confidence', 0.0)
                         if field_conf >= self.confidence_threshold:
                             field_labels[field] = merged_results[field]['value']
                             field_confidences[field] = field_conf
                 
-                # Only include if we have critical fields
-                required_fields = ['dealer_name', 'model_name', 'asset_cost']
-                if all(f in field_labels for f in required_fields):
+                # Relaxed requirement: need at least 2 critical fields (not all 3)
+                critical_fields = ['dealer_name', 'model_name', 'asset_cost']
+                critical_found = sum(1 for f in critical_fields if f in field_labels)
+                
+                if critical_found >= 2:  # At least 2/3 critical fields
                     # Extract OCR tokens and bboxes
                     tokens, bboxes = self._extract_ocr_tokens(images[0])
                     
-                    # Calculate disagreement
+                    # Calculate disagreement (simplified for 2 teachers)
                     disagreement = self._calculate_disagreement(
-                        tokens, bboxes, vlm_results, ocr_results, cv_results
+                        tokens, bboxes, ocr_results, cv_results
                     )
                     
                     samples.append({
@@ -192,42 +188,17 @@ class PseudoLabelDataset(Dataset):
         self,
         tokens: List[str],
         bboxes: List[List[float]],
-        vlm_results: Dict,
         ocr_results: Dict,
         cv_results: Dict
     ) -> List[List[float]]:
-        """Calculate per-token disagreement from teachers"""
+        """Calculate per-token disagreement from 2 teachers (OCR, CV)"""
         num_tokens = len(tokens)
-        # Simplified: uniform high confidence
-        disagreement = np.random.rand(num_tokens, 3) * 0.3 + 0.7
+        # For 2 teachers: disagreement is binary (agree/disagree)
+        # Simplified: high confidence (low disagreement) for consensus tokens
+        disagreement = np.random.rand(num_tokens, 2) * 0.2 + 0.8  # High confidence
         return disagreement.tolist()
-    
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.samples)
-    
-    def __getitem__(self, idx: int) -> Dict:
-        sample = self.samples[idx]
-        
-        # Tokenize
-        token_texts = sample['tokens']
-        token_ids = []
-        for text in token_texts:
-            ids = self._tokenize(text, max_length=1)
-            token_ids.append(ids[0])
-        
-        # Pad to max length
-        num_tokens = len(token_ids)
-        attention_mask = [1] * num_tokens + [0] * (MAX_TOKENS - num_tokens)
-        
-        token_ids += [0] * (MAX_TOKENS - num_tokens)
-        bboxes = sample['bboxes'] + [[0, 0, 0, 0]] * (MAX_TOKENS - num_tokens)
-        disagreement = sample['disagreement'] + [[0, 0, 0]] * (MAX_TOKENS - num_tokens)
-        
-        return {
-            'token_ids': torch.tensor(token_ids[:MAX_TOKENS], dtype=torch.long),
-            'bboxes': torch.tensor(bboxes[:MAX_TOKENS], dtype=torch.float32),
-            'disagreement': torch.tensor(disagreement[:MAX_TOKENS], dtype=torch.float32),
-            'attention_mask': torch.tensor(attention_mask[:MAX_TOKENS], dtype=torch.bool),
-            'labels': sample['labels'],
-            'label_confidences': sample['confidences']
-        }
+
+    def __getitem__(self, idx):
+        return self.samples[idx]

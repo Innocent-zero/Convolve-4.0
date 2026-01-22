@@ -19,7 +19,7 @@ logging.basicConfig(
 
 from config import CHECKPOINT_DIR
 from utils.preprocessing import DocumentPreprocessor
-from utils.extractors import VLMExtractor, OCRExtractor, CVExtractor, TeacherEnsemble
+from utils.extractors import LayoutLMv3Extractor, OCRExtractor, CVExtractor, TeacherEnsemble
 from inference.sgan_extractor import SGANExtractor
 from inference.ensemble_v2 import InferenceEnsemble
 from utils.validators import FieldValidator
@@ -46,10 +46,10 @@ def train_mode():
     
     # Initialize components
     preprocessor = DocumentPreprocessor()
-    vlm = VLMExtractor()
+    vlm = LayoutLMv3Extractor()
     ocr = OCRExtractor()
     cv = CVExtractor()
-    teacher_ensemble = TeacherEnsemble(vlm, ocr, cv)
+    teacher_ensemble = TeacherEnsemble(ocr, cv)
     
     # Train
     trained_model = train_sgan_model(
@@ -81,7 +81,7 @@ def inference_mode(image_path: str):
     sgan = SGANExtractor(checkpoint_path=str(checkpoint_path))
     
     # Load fallback extractors (teachers)
-    vlm = VLMExtractor()
+    vlm = LayoutLMv3Extractor()
     ocr = OCRExtractor()
     cv = CVExtractor()
     

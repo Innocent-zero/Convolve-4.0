@@ -1,5 +1,5 @@
 """
-Teacher Extractors (VLM, OCR, CV)
+Teacher Extractors (LayoutLMv3, OCR, CV)
 These are used ONLY for generating pseudo-labels during training.
 They are NOT used during inference with the trained SGAN model.
 """
@@ -8,141 +8,189 @@ import re
 import numpy as np
 from typing import List, Dict, Any, Optional
 import cv2
-from easyocr import easyocr
-from PIL import Image
+import easyocr
 import torch
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import LayoutLMv3Processor, LayoutLMv3ForTokenClassification
 import warnings
-import json
 warnings.filterwarnings('ignore')
 
 
-class VLMExtractor:
-    """Vision-Language Model (Teacher for pseudo-label generation)"""
+class LayoutLMv3Extractor:
+    """
+    LayoutLMv3-based extractor for text fields (dealer_name, model_name)
+    Uses token classification with BIO tagging scheme
+    """
     
-    def __init__(self, model_name: str = "Qwen/Qwen2-VL-2B-Instruct"):
-        print(f"    Loading Teacher VLM ({model_name})...")
+    def __init__(self, model_name: str = "microsoft/layoutlmv3-base"):
+        print(f"    Loading LayoutLMv3 ({model_name})...")
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            device_map="auto" if self.device == "cuda" else None
+        
+        # Load processor and model
+        self.processor = LayoutLMv3Processor.from_pretrained(
+            model_name, 
+            apply_ocr=False
         )
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        
-        if self.device == "cpu":
-            self.model = self.model.to(self.device)
-        
+        self.model = LayoutLMv3ForTokenClassification.from_pretrained(
+            model_name,
+            num_labels=5  # O, B-DEALER, I-DEALER, B-MODEL, I-MODEL
+        )
+        self.model.to(self.device)
         self.model.eval()
-        print(f"    Teacher VLM loaded on {self.device}")
+        
+        # Label mapping for BIO scheme
+        self.label_map = {
+            0: 'O',
+            1: 'B-DEALER',
+            2: 'I-DEALER',
+            3: 'B-MODEL',
+            4: 'I-MODEL'
+        }
+        
+        print(f"    LayoutLMv3 loaded on {self.device}")
     
-    def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Extract fields using VLM"""
+    def extract(self, images: List[np.ndarray], language: str, ocr_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract text fields using LayoutLMv3 token classification
+        
+        Args:
+            images: List of document images
+            language: Document language
+            ocr_data: Pre-extracted OCR tokens and bboxes
+            
+        Returns:
+            Extracted fields with confidence scores
+        """
         try:
-            if not images:
+            if not images or not ocr_data or not ocr_data.get('tokens'):
                 return self._get_empty()
             
-            pil_images = []
-            for img in images:
-                if img is None:
-                    continue
-                if img.dtype == np.uint8:
-                    pil_images.append(Image.fromarray(img))
-                else:
-                    pil_images.append(Image.fromarray((img * 255).astype(np.uint8)))
+            # Use first image
+            image = images[0]
+            tokens = ocr_data['tokens']
+            bboxes = ocr_data['bboxes']
             
-            if not pil_images:
+            if len(tokens) == 0:
                 return self._get_empty()
             
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {
-                            "type": "text",
-                            "text": (
-                                "Extract the following from this invoice/quotation in JSON format:\n"
-                                "{\n"
-                                '  "dealer_name": {"value": "...", "confidence": 0.0-1.0},\n'
-                                '  "model_name": {"value": "...", "confidence": 0.0-1.0},\n'
-                                '  "horse_power": {"value": number, "confidence": 0.0-1.0},\n'
-                                '  "asset_cost": {"value": number, "confidence": 0.0-1.0},\n'
-                                '  "signature": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0},\n'
-                                '  "stamp": {"present": true/false, "bbox": [x1, y1, x2, y2], "confidence": 0.0-1.0}\n'
-                                "}"
-                            )
-                        }
-                    ]
-                }
-            ]
-
-            prompt = self.processor.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-
-            inputs = self.processor(
-                text=[prompt],
-                images=pil_images,
+            # Normalize bboxes to LayoutLMv3 format (0-1000 scale)
+            img_h, img_w = image.shape[:2]
+            normalized_boxes = []
+            for bbox in bboxes:
+                # bbox is [x1, y1, x2, y2] in pixel coordinates
+                x1, y1, x2, y2 = bbox
+                # Convert to 0-1000 scale
+                norm_box = [
+                    int((x1 / img_w) * 1000),
+                    int((y1 / img_h) * 1000),
+                    int((x2 / img_w) * 1000),
+                    int((y2 / img_h) * 1000)
+                ]
+                normalized_boxes.append(norm_box)
+            
+            # Prepare inputs for LayoutLMv3
+            encoding = self.processor(
+                image,
+                text=tokens,
+                boxes=normalized_boxes,
                 return_tensors="pt",
-                padding=True
-            ).to(self.device)
-
-            inputs["attention_mask"] = torch.ones_like(inputs["input_ids"])
-
+                truncation=True,
+                padding="max_length",
+                max_length=512
+            )
             
+            # Move to device
+            encoding = {k: v.to(self.device) for k, v in encoding.items()}
+            
+            # Run inference
             with torch.no_grad():
-                output_ids = self.model.generate(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    pixel_values=inputs["pixel_values"],
-                    max_new_tokens=512
-                )
+                outputs = self.model(**encoding)
+                logits = outputs.logits
             
-            generated_text = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            # Get predictions
+            predictions = torch.argmax(logits, dim=-1)[0]  # [seq_len]
+            probabilities = torch.softmax(logits, dim=-1)[0]  # [seq_len, num_labels]
             
-            return self._parse_response(generated_text)
+            # Decode predictions to extract fields
+            dealer_name, dealer_conf = self._extract_field(
+                tokens, predictions, probabilities, 'DEALER'
+            )
+            
+            model_name, model_conf = self._extract_field(
+                tokens, predictions, probabilities, 'MODEL'
+            )
+            
+            return {
+                'dealer_name': {'value': dealer_name, 'confidence': dealer_conf},
+                'model_name': {'value': model_name, 'confidence': model_conf},
+                'horse_power': {'value': None, 'confidence': 0.0},
+                'asset_cost': {'value': None, 'confidence': 0.0},
+                'signature': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0},
+                'stamp': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+            }
         
         except Exception as e:
-            print(f"    VLM extraction error: {e}")
+            print(f"    LayoutLMv3 extraction error: {e}")
             return self._get_empty()
     
-    def _parse_response(self, response: str) -> Dict[str, Any]:
-        try:
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                return self._normalize(parsed)
-            else:
-                return self._get_empty()
-        except:
-            return self._get_empty()
-    
-    def _normalize(self, data: Dict) -> Dict[str, Any]:
-        normalized = {}
-        for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
-            if field in data:
-                normalized[field] = {
-                    'value': data[field].get('value'),
-                    'confidence': float(data[field].get('confidence', 0.7))
-                }
-            else:
-                normalized[field] = {'value': None, 'confidence': 0.0}
+    def _extract_field(
+        self,
+        tokens: List[str],
+        predictions: torch.Tensor,
+        probabilities: torch.Tensor,
+        field_type: str
+    ) -> tuple[Optional[str], float]:
+        """
+        Extract field value from BIO-tagged tokens
         
-        for field in ['signature', 'stamp']:
-            if field in data:
-                normalized[field] = {
-                    'present': bool(data[field].get('present', False)),
-                    'bbox': data[field].get('bbox', [0, 0, 0, 0]),
-                    'confidence': float(data[field].get('confidence', 0.5))
-                }
-            else:
-                normalized[field] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+        Args:
+            tokens: List of OCR tokens
+            predictions: Predicted label IDs
+            probabilities: Label probabilities
+            field_type: 'DEALER' or 'MODEL'
+            
+        Returns:
+            (field_value, confidence)
+        """
+        b_label = f'B-{field_type}'
+        i_label = f'I-{field_type}'
         
-        return normalized
+        # Find label IDs
+        b_id = None
+        i_id = None
+        for label_id, label_name in self.label_map.items():
+            if label_name == b_label:
+                b_id = label_id
+            elif label_name == i_label:
+                i_id = label_id
+        
+        if b_id is None:
+            return None, 0.0
+        
+        # Extract tokens with matching labels
+        field_tokens = []
+        field_probs = []
+        
+        for idx, pred in enumerate(predictions):
+            if idx >= len(tokens):
+                break
+            
+            pred_id = pred.item()
+            if pred_id == b_id or pred_id == i_id:
+                field_tokens.append(tokens[idx])
+                # Get probability for this prediction
+                field_probs.append(probabilities[idx, pred_id].item())
+        
+        if not field_tokens:
+            return None, 0.0
+        
+        # Combine tokens
+        field_value = ' '.join(field_tokens)
+        
+        # Calculate confidence as mean probability
+        confidence = float(np.mean(field_probs)) if field_probs else 0.0
+        
+        return field_value, confidence
     
     def _get_empty(self) -> Dict[str, Any]:
         return {
@@ -156,22 +204,31 @@ class VLMExtractor:
 
 
 class OCRExtractor:
-    """OCR-based extractor using EasyOCR (Teacher for pseudo-label generation)"""
+    """OCR-based extractor using EasyOCR + Rule-based extraction"""
     
     def __init__(self):
         print("    Loading Teacher OCR (EasyOCR)...")
-        # Initialize EasyOCR with English language
-        # Set gpu=True if CUDA is available, gpu=False otherwise
         self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
         print(f"    EasyOCR loaded (GPU: {torch.cuda.is_available()})")
     
-    def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
-        """Extract fields using OCR + regex"""
+    def extract_tokens(self, images: List[np.ndarray]) -> Dict[str, Any]:
+        """
+        Extract OCR tokens with bounding boxes (for LayoutLMv3 input)
+        
+        Returns:
+            {
+                'tokens': List[str],
+                'bboxes': List[List[int]],  # [x1, y1, x2, y2] in pixels
+                'confidence': List[float]
+            }
+        """
         try:
             if not images:
-                return self._get_empty()
+                return {'tokens': [], 'bboxes': [], 'confidence': []}
             
-            all_text = []
+            tokens = []
+            bboxes = []
+            confidences = []
             
             for image in images:
                 if image is None:
@@ -181,48 +238,237 @@ class OCRExtractor:
                     # EasyOCR readtext returns: (bbox, text, confidence)
                     results = self.reader.readtext(image)
                     
-                    for (bbox, text, confidence) in results:
-                        all_text.append({
-                            'text': text,
-                            'confidence': float(confidence),
-                            'bbox': bbox  # EasyOCR bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                        })
+                    for (bbox_coords, text, confidence) in results:
+                        # bbox_coords is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                        x_coords = [p[0] for p in bbox_coords]
+                        y_coords = [p[1] for p in bbox_coords]
+                        
+                        # Convert to [x1, y1, x2, y2]
+                        bbox = [
+                            int(min(x_coords)),
+                            int(min(y_coords)),
+                            int(max(x_coords)),
+                            int(max(y_coords))
+                        ]
+                        
+                        tokens.append(text)
+                        bboxes.append(bbox)
+                        confidences.append(float(confidence))
+                
                 except Exception as e:
                     print(f"    OCR error on image: {e}")
                     continue
-
-            return self._extract_fields(all_text)
+            
+            return {
+                'tokens': tokens,
+                'bboxes': bboxes,
+                'confidence': confidences
+            }
+        
+        except Exception as e:
+            print(f"    OCR token extraction error: {e}")
+            return {'tokens': [], 'bboxes': [], 'confidence': []}
+    
+    def extract(self, images: List[np.ndarray], language: str) -> Dict[str, Any]:
+        """
+        Extract fields using OCR + rule-based methods
+        
+        Args:
+            images: List of document images
+            language: Document language
+            
+        Returns:
+            Extracted fields (text + numeric via rules)
+        """
+        try:
+            if not images:
+                return self._get_empty()
+            
+            # Get OCR tokens
+            ocr_data = self.extract_tokens(images)
+            tokens = ocr_data['tokens']
+            
+            if not tokens:
+                return self._get_empty()
+            
+            # Combine all text for rule-based extraction
+            full_text = ' '.join(tokens)
+            
+            # Extract text fields using heuristics
+            dealer_name = self._extract_dealer_name(tokens, full_text)
+            model_name = self._extract_model_name(tokens, full_text)
+            
+            # Extract numeric fields using rules
+            horse_power = self._extract_horse_power(full_text)
+            asset_cost = self._extract_asset_cost(full_text)
+            
+            return {
+                'dealer_name': dealer_name,
+                'model_name': model_name,
+                'horse_power': horse_power,
+                'asset_cost': asset_cost,
+                'signature': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0},
+                'stamp': {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+            }
         
         except Exception as e:
             print(f"    OCR extraction error: {e}")
             return self._get_empty()
-    
-    def _extract_fields(self, text_blocks: List[Dict]) -> Dict[str, Any]:
-        full_text = ' '.join([t['text'] for t in text_blocks])
+
+    def _extract_dealer_name(self, tokens: List[str], text: str) -> Dict[str, Any]:
+        """
+        Extract dealer name using position + keyword heuristics
         
-        patterns = {
-            'dealer_name': r'(?:dealer|vendor|seller)[\s:]+([A-Za-z\s&.]+(?:Ltd|Pvt|Inc)?)',
-            'model_name': r'(?:model|tractor|vehicle)[\s:]+([A-Za-z0-9\s]+(?:DI|HP)?)',
-            'horse_power': r'(\d+)\s*(?:HP|hp|Horse\s*Power)',
-            'asset_cost': r'(?:cost|price|amount|total)[\s:Rs.₹]*(\d+(?:,\d+)*)'
-        }
+        Strategy:
+        - Look for tokens near top of document (first 20% of tokens)
+        - Match against dealer keywords or proper noun patterns
+        - Fallback: longest capitalized sequence in top section
+        """
+        try:
+            # Top section heuristic (first 20% of tokens)
+            top_section_size = max(5, len(tokens) // 5)
+            top_tokens = tokens[:top_section_size]
+            
+            # Keyword patterns for dealer identification
+            dealer_keywords = ['dealer', 'showroom', 'motors', 'auto', 'sales', 'pvt', 'ltd']
+            
+            # Find tokens matching dealer patterns
+            candidates = []
+            for i, token in enumerate(top_tokens):
+                token_lower = token.lower()
+                # Check if contains dealer keywords
+                if any(kw in token_lower for kw in dealer_keywords):
+                    # Expand context: take 2-3 tokens around match
+                    start = max(0, i - 1)
+                    end = min(len(top_tokens), i + 3)
+                    candidate = ' '.join(top_tokens[start:end])
+                    candidates.append((candidate, 0.90))
+                # Check if proper noun (capitalized, > 3 chars)
+                elif token[0].isupper() and len(token) > 3 and token.isalpha():
+                    candidates.append((token, 0.70))
+            
+            if candidates:
+                # Return highest confidence candidate
+                best_candidate = max(candidates, key=lambda x: x[1])
+                return {'value': best_candidate[0], 'confidence': best_candidate[1]}
+            
+            # Fallback: longest capitalized sequence in top section
+            capitalized_sequences = []
+            current_seq = []
+            for token in top_tokens:
+                if token and token[0].isupper():
+                    current_seq.append(token)
+                else:
+                    if len(current_seq) >= 2:
+                        capitalized_sequences.append(' '.join(current_seq))
+                    current_seq = []
+            
+            if capitalized_sequences:
+                longest = max(capitalized_sequences, key=len)
+                return {'value': longest, 'confidence': 0.65}
+            
+            return {'value': None, 'confidence': 0.0}
         
-        extracted = {}
+        except Exception as e:
+            return {'value': None, 'confidence': 0.0}
+
+    def _extract_model_name(self, tokens: List[str], text: str) -> Dict[str, Any]:
+        """
+        Extract model name using pattern matching
         
-        for field, pattern in patterns.items():
-            match = re.search(pattern, full_text, re.IGNORECASE)
+        Patterns:
+        - Common tractor/vehicle model formats: "ABC-123", "Model X123"
+        - Keywords: "model", "variant", "type"
+        - Alphanumeric sequences with specific structure
+        """
+        try:
+            # Pattern 1: Model keyword + alphanumeric
+            model_pattern_1 = r'(?:model|variant|type)[\s:]*([A-Z0-9\-]{3,15})'
+            match = re.search(model_pattern_1, text, re.IGNORECASE)
             if match:
-                value = match.group(1).strip()
-                if field in ['horse_power', 'asset_cost']:
-                    value = int(re.sub(r'[^\d]', '', value))
-                extracted[field] = {'value': value, 'confidence': 0.80}
-            else:
-                extracted[field] = {'value': None, 'confidence': 0.0}
+                return {'value': match.group(1), 'confidence': 0.90}
+            
+            # Pattern 2: Standalone alphanumeric model codes (e.g., "DI-745", "MF375")
+            model_pattern_2 = r'\b([A-Z]{2,4}[\-\s]?\d{3,4})\b'
+            match = re.search(model_pattern_2, text)
+            if match:
+                return {'value': match.group(1), 'confidence': 0.85}
+            
+            # Pattern 3: Search tokens for model-like strings
+            for token in tokens:
+                # Alphanumeric with dash/hyphen
+                if re.match(r'^[A-Z]{2,4}\-\d{2,4}$', token):
+                    return {'value': token, 'confidence': 0.80}
+                # All caps + numbers
+                if re.match(r'^[A-Z]+\d{2,4}$', token) and 4 <= len(token) <= 8:
+                    return {'value': token, 'confidence': 0.75}
+            
+            return {'value': None, 'confidence': 0.0}
         
-        extracted['signature'] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.5}
-        extracted['stamp'] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.5}
+        except Exception as e:
+            return {'value': None, 'confidence': 0.0}
+    
+    def _extract_horse_power(self, text: str) -> Dict[str, Any]:
+        """
+        Extract horse power using regex patterns
         
-        return extracted
+        Patterns:
+        - (\d{2,3})\s*(hp|HP|एचपी|हॉर्स)
+        - Range: 10-150
+        """
+        patterns = [
+            r'(\d{2,3})\s*(?:hp|HP|एचपी|हॉर्स|horse\s*power)',
+            r'(?:power|hp|HP)[\s:]+(\d{2,3})',
+            r'(\d{2,3})\s*HP'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    value = int(match.group(1))
+                    # Validate range
+                    if 10 <= value <= 150:
+                        # High confidence if keyword-anchored
+                        confidence = 0.95 if 'hp' in match.group(0).lower() else 0.70
+                        return {'value': value, 'confidence': confidence}
+                except:
+                    continue
+        
+        return {'value': None, 'confidence': 0.0}
+    
+    def _extract_asset_cost(self, text: str) -> Dict[str, Any]:
+        """
+        Extract asset cost using regex patterns
+        
+        Patterns:
+        - ₹?\s?\d{1,3}(,\d{3})+
+        - Range: 50,000-5,000,000
+        """
+        patterns = [
+            r'(?:cost|price|amount|total|₹)[\s:]*₹?\s?(\d{1,3}(?:,\d{3})+)',
+            r'₹\s?(\d{1,3}(?:,\d{3})+)',
+            r'(?:Rs\.?|INR)[\s]*(\d{1,3}(?:,\d{3})+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    # Remove commas and convert to int
+                    value_str = match.group(1).replace(',', '')
+                    value = int(value_str)
+                    
+                    # Validate range
+                    if 50000 <= value <= 5000000:
+                        # High confidence if keyword-anchored
+                        has_keyword = any(kw in match.group(0).lower() for kw in ['cost', 'price', 'amount', 'total', '₹', 'rs'])
+                        confidence = 0.95 if has_keyword else 0.70
+                        return {'value': value, 'confidence': confidence}
+                except:
+                    continue
+        
+        return {'value': None, 'confidence': 0.0}
     
     def _get_empty(self) -> Dict[str, Any]:
         return {
@@ -381,26 +627,25 @@ class TeacherEnsemble:
     Used ONLY during training to create pseudo-labels.
     """
     
-    def __init__(self, vlm: VLMExtractor, ocr: OCRExtractor, cv: CVExtractor):
-        self.vlm = vlm
+    def __init__(self, ocr: OCRExtractor, cv: CVExtractor):
         self.ocr = ocr
         self.cv = cv
-        self.weights = {'vlm': 0.35, 'ocr': 0.30, 'cv': 0.35}
-    
+        self.weights = {'ocr': 0.50, 'cv': 0.50}
+
     def generate_pseudo_labels(
         self,
         images: List[np.ndarray],
         language: str
-    ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-        """Generate pseudo-labels from all three teachers - RETURNS DICTS NOT NONE"""
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Generate pseudo-labels from OCR and CV only"""
+        # Get OCR tokens (still needed for SGAN input)
         try:
-            vlm_results = self.vlm.extract(images, language)
-            if vlm_results is None:
-                vlm_results = self.vlm._get_empty()
+            ocr_tokens = self.ocr.extract_tokens(images)
         except Exception as e:
-            print(f"    VLM extraction failed: {e}")
-            vlm_results = self.vlm._get_empty()
+            print(f"    OCR token extraction failed: {e}")
+            ocr_tokens = {'tokens': [], 'bboxes': [], 'confidence': []}
         
+        # OCR rule-based extraction (text + numeric fields)
         try:
             ocr_results = self.ocr.extract(images, language)
             if ocr_results is None:
@@ -409,6 +654,7 @@ class TeacherEnsemble:
             print(f"    OCR extraction failed: {e}")
             ocr_results = self.ocr._get_empty()
         
+        # CV extraction (visual elements)
         try:
             cv_results = self.cv.extract(images, language)
             if cv_results is None:
@@ -417,52 +663,29 @@ class TeacherEnsemble:
             print(f"    CV extraction failed: {e}")
             cv_results = self.cv._get_empty()
         
-        return vlm_results, ocr_results, cv_results
+        return ocr_results, cv_results
     
     def merge_predictions(
         self,
-        vlm_results: Dict[str, Any],
         ocr_results: Dict[str, Any],
         cv_results: Dict[str, Any]
     ) -> Dict[str, Any]:
-        """Merge predictions using weighted voting"""
+        """Merge predictions using OCR + CV only"""
         merged = {}
-        text_fields = ['dealer_name', 'model_name', 'horse_power', 'asset_cost']
         
-        for field in text_fields:
-            candidates = []
-            for result, source in [(vlm_results, 'vlm'), (ocr_results, 'ocr'), (cv_results, 'cv')]:
-                if field in result and result[field]['value'] is not None:
-                    weighted_conf = (
-                        result[field]['confidence'],
-                        self.weights[source]
-                    )
-                    candidates.append((result[field]['value'], weighted_conf))
-            
-            if candidates:
-                best_value, best_pair = max(
-                    candidates,
-                    key=lambda x: x[1][0] * x[1][1]
-                )
-                merged[field] = {
-                    'value': best_value,
-                    'confidence': best_pair[0]
-                }
+        # All text/numeric fields: Use OCR exclusively
+        for field in ['dealer_name', 'model_name', 'horse_power', 'asset_cost']:
+            if field in ocr_results and ocr_results[field]['value'] is not None:
+                merged[field] = ocr_results[field]
             else:
                 merged[field] = {'value': None, 'confidence': 0.0}
         
-        # Visual fields
+        # Visual fields: Use CV/YOLO
         for field in ['signature', 'stamp']:
-            best_detection = None
-            best_score = 0
-            for result, source in [(vlm_results, 'vlm'), (ocr_results, 'ocr'), (cv_results, 'cv')]:
-                if field in result and result[field]['present']:
-                    score = result[field]['confidence'] * self.weights[source]
-                    if score > best_score:
-                        best_score = score
-                        best_detection = result[field]
-            
-            merged[field] = best_detection if best_detection else {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
+            if field in cv_results and cv_results[field]['present']:
+                merged[field] = cv_results[field]
+            else:
+                merged[field] = {'present': False, 'bbox': [0, 0, 0, 0], 'confidence': 0.0}
         
         # Determine validity
         has_any_text = any(
@@ -475,5 +698,5 @@ class TeacherEnsemble:
             merged['stamp']['present']
         )
 
-        merged['valid'] = has_any_text or has_any_visual  
+        merged['valid'] = has_any_text or has_any_visual
         return merged
